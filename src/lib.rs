@@ -97,29 +97,30 @@ impl Condvar {
 
     pub fn wait_while<'a, T, F>(
         &self,
-        guard: MutexGuard<'a, T>,
+        mut guard: MutexGuard<'a, T>,
         mut condition: F
     ) -> LockResult<MutexGuard<'a, T>> where
         F: FnMut(&mut T) -> bool
     {
-        let _condition = self.wait_in_queue();
-        _condition.condvar.wait_while(guard, |guard| {
-            condition(guard) || _condition.sleep.load(Ordering::Relaxed)
-        })
+        while condition(&mut guard) { guard = self.wait(guard)?; };
+        Ok(guard)
     }
 
     pub fn wait_timeout_while<'a, T, F>(
         &self,
-        guard: MutexGuard<'a, T>,
+        mut guard: MutexGuard<'a, T>,
         duration: Duration,
         mut condition: F
     ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> where
         F: FnMut(&mut T) -> bool
     {
-        let _condition = self.wait_in_queue();
-        _condition.condvar.wait_timeout_while(guard, duration, |guard| {
-            condition(guard) || _condition.sleep.load(Ordering::Relaxed)
-        })
+        let mut timeout = construct_empty_timeout();
+        while condition(&mut guard) {
+            let result = self.wait_timeout(guard, duration)?;
+            guard = result.0;
+            timeout = result.1;
+        }
+        Ok((guard, timeout))
     }
 
     pub fn notify_one(&self) {
@@ -138,6 +139,14 @@ impl Condvar {
             }
         }
     }
+}
+
+fn construct_empty_timeout() -> WaitTimeoutResult {
+    Condvar::new().wait_timeout_while(
+        Mutex::new(()).lock().unwrap(),
+        std::time::Duration::from_secs(1),
+        |_| false
+    ).unwrap().1
 }
 
 #[cfg(test)]
@@ -161,5 +170,21 @@ mod tests {
         data.1.notify_one();
 
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn timeout() {
+        use std::sync::{ Arc, Mutex };
+        let data1 = Arc::new((Mutex::new(()), Condvar::new()));
+        let data2 = data1.clone();
+
+        let t = std::thread::spawn(move || {
+            let lock = data2.0.lock().unwrap();
+            println!("{:?}", data2.1.wait_timeout(lock, std::time::Duration::from_secs(1)));
+        });
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        t.join().unwrap();
     }
 }
