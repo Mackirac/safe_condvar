@@ -1,4 +1,4 @@
-use std::collections::LinkedList;
+use std::collections::VecDeque;
 use std::time::Duration;
 use std::sync::{ self,
     atomic::{ Ordering, AtomicBool },
@@ -23,7 +23,7 @@ impl Default for Condition {
 pub struct Condvar {
     locked: Mutex<bool>,
     condvar: sync::Condvar,
-    queue: *mut LinkedList<Box<Condition>>,
+    queue: *mut VecDeque<Box<Condition>>,
 }
 
 unsafe impl Send for Condvar {}
@@ -42,18 +42,16 @@ impl Condvar {
         Condvar {
             locked: Mutex::new(false),
             condvar: sync::Condvar::new(),
-            queue: Box::into_raw(Box::new(LinkedList::new())),
+            queue: Box::into_raw(Box::new(VecDeque::new())),
         }
     }
 
     fn entry_protocol(&self) {
         let mut locked = self.locked.lock().unwrap();
-        locked = self.condvar
-                     .wait_while(
-                         locked,
-                         |locked| *locked
-                     )
-                     .unwrap();
+        locked = self.condvar.wait_while(
+            locked,
+            |locked| *locked
+        ).unwrap();
         *locked = true;
     }
 
@@ -90,9 +88,15 @@ impl Condvar {
     ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)>
     {
         let _condition = self.wait_in_queue();
-        _condition.condvar.wait_timeout_while(guard, duration,
+        let result = _condition.condvar.wait_timeout_while(guard, duration,
             |_| { _condition.sleep.load(Ordering::Relaxed) }
-        )
+        )?;
+        if result.1.timed_out() { atomic! { self =>
+            let queue = unsafe { self.queue.as_mut().unwrap() };
+            let index = queue.iter().position(|cond| { std::ptr::eq(&**cond, _condition) });
+            if let Some(index) = index { queue.remove(index); }                    
+        }}
+        Ok(result)
     }
 
     pub fn wait_while<'a, T, F>(
@@ -119,6 +123,7 @@ impl Condvar {
             let result = self.wait_timeout(guard, duration)?;
             guard = result.0;
             timeout = result.1;
+            if timeout.timed_out() { break; }
         }
         Ok((guard, timeout))
     }
@@ -150,9 +155,10 @@ fn construct_empty_timeout() -> WaitTimeoutResult {
 }
 
 #[cfg(test)]
-mod tests {
+mod black_box_tests {
     use super::Condvar;
     use std::sync::{ Arc, Mutex };
+
     #[test]
     fn main_test() {
         let data = Arc::new((Mutex::new(()), Condvar::new()));
@@ -174,17 +180,37 @@ mod tests {
 
     #[test]
     fn timeout() {
-        use std::sync::{ Arc, Mutex };
-        let data1 = Arc::new((Mutex::new(()), Condvar::new()));
-        let data2 = data1.clone();
+        let data = Arc::new((Mutex::new(()), Condvar::new()));
+        let data1 = data.clone();
+        let data2 = data.clone();
 
-        let t = std::thread::spawn(move || {
+        let t1 = std::thread::spawn(move || {
+            let lock = data1.0.lock().unwrap();
+            let result = data1.1.wait_timeout(
+                lock,
+                std::time::Duration::from_secs(1)
+            );
+            println!("{:?}", result);
+            result.unwrap().1
+        });
+        
+        let t2 = std::thread::spawn(move || {
             let lock = data2.0.lock().unwrap();
-            println!("{:?}", data2.1.wait_timeout(lock, std::time::Duration::from_secs(1)));
+            let result = data2.1.wait_timeout(
+                lock,
+                std::time::Duration::from_secs(4)
+            );
+            println!("{:?}", result);
+            result.unwrap().1
         });
 
         std::thread::sleep(std::time::Duration::from_secs(2));
+        data.1.notify_one();
 
-        t.join().unwrap();
+        let result1 = t1.join().unwrap();
+        let result2 = t2.join().unwrap();
+
+        assert!(result1.timed_out());
+        assert!(!result2.timed_out());
     }
 }
